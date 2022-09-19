@@ -22,7 +22,9 @@ type DeviceCallbacks struct {
 }
 
 // Device represents a streaming instance.
-type Device uintptr
+type Device struct {
+	ptr *unsafe.Pointer
+}
 
 // InitDevice initializes a device.
 //
@@ -34,17 +36,22 @@ type Device uintptr
 //
 // The returned instance has to be cleaned up using Uninit().
 func InitDevice(context Context, deviceConfig DeviceConfig, deviceCallbacks DeviceCallbacks) (*Device, error) {
-	dev := Device(C.ma_aligned_malloc(C.sizeof_ma_device, simdAlignment, nil))
-	if dev == 0 {
+	ptr := C.ma_malloc(C.sizeof_ma_device, nil)
+	dev := Device{
+		ptr: &ptr,
+	}
+	if uintptr(*dev.ptr) == 0 {
 		return nil, ErrOutOfMemory
 	}
+	devConfigC, release := deviceConfig.toC()
+	defer release()
 
 	rawDevice := dev.cptr()
-	C.goSetDeviceConfigCallbacks(deviceConfig.cptr())
-	result := C.ma_device_init(context.cptr(), deviceConfig.cptr(), rawDevice)
+	C.goSetDeviceConfigCallbacks(&devConfigC)
+	result := C.ma_device_init(context.cptr(), &devConfigC, rawDevice)
 	if result != 0 {
 		dev.free()
-		return nil, errorFromResult(Result(result))
+		return nil, errorFromResult(result)
 	}
 	deviceMutex.Lock()
 	dataCallbacks[rawDevice] = deviceCallbacks.Data
@@ -55,11 +62,13 @@ func InitDevice(context Context, deviceConfig DeviceConfig, deviceCallbacks Devi
 }
 
 func (dev Device) cptr() *C.ma_device {
-	return (*C.ma_device)(unsafe.Pointer(dev))
+	return (*C.ma_device)(*dev.ptr)
 }
 
 func (dev Device) free() {
-	C.ma_aligned_free(unsafe.Pointer(dev), nil)
+	if dev.ptr != nil {
+		C.ma_free(*dev.ptr, nil)
+	}
 }
 
 // Type returns device type.
@@ -103,7 +112,7 @@ func (dev *Device) SampleRate() uint32 {
 // waits on a mutex for thread-safety.
 func (dev *Device) Start() error {
 	result := C.ma_device_start(dev.cptr())
-	return errorFromResult(Result(result))
+	return errorFromResult(result)
 }
 
 // IsStarted determines whether or not the device is started.
@@ -120,7 +129,7 @@ func (dev *Device) IsStarted() bool {
 // the buffer size that was specified at initialization time).
 func (dev *Device) Stop() error {
 	result := C.ma_device_stop(dev.cptr())
-	return errorFromResult(Result(result))
+	return errorFromResult(result)
 }
 
 // Uninit uninitializes a device.
@@ -149,18 +158,18 @@ func goDataCallback(pDevice *C.ma_device, pOutput, pInput unsafe.Pointer, frameC
 	deviceMutex.Unlock()
 
 	if callback != nil {
-		inputSamples := []byte(nil)
-		outputSamples := []byte(nil)
+		var inputSamples, outputSamples []byte
+
 		if pOutput != nil {
 			sampleCount := uint32(frameCount) * uint32(pDevice.playback.channels)
 			sizeInBytes := uint32(C.ma_get_bytes_per_sample(pDevice.playback.format))
-			outputSamples = (*[1 << 30]byte)(pOutput)[0 : sampleCount*sizeInBytes]
+			outputSamples = unsafe.Slice((*byte)(pOutput), sampleCount*sizeInBytes)
 		}
 
 		if pInput != nil {
 			sampleCount := uint32(frameCount) * uint32(pDevice.capture.channels)
 			sizeInBytes := uint32(C.ma_get_bytes_per_sample(pDevice.capture.format))
-			inputSamples = (*[1 << 30]byte)(pInput)[0 : sampleCount*sizeInBytes]
+			inputSamples = unsafe.Slice((*byte)(pInput), sampleCount*sizeInBytes)
 		}
 
 		callback(outputSamples, inputSamples, uint32(frameCount))
